@@ -33,33 +33,42 @@ class MagnificationSensor:
         self._initialize_sensor()
 
     def _initialize_sensor(self):
-        if not LIBRARY_INSTALLED:
-            print("⚠️ Cannot initialize: Library missing.")
+        """Initialize the VL53L0X sensor with Hardware Check"""
+        if not SENSOR_AVAILABLE:
+            print("📡 Library missing - Check installation of adafruit-blinka")
             return
 
         try:
-            # Setup I2C
+            # BAGIAN PERBAIKAN: Inisialisasi Pin XSHUT (Gaya Kating 1-ke-1)
+            # Hubungkan XSHUT VLX ke Pin 7 (GPIO 4) Raspberry Pi
+            import digitalio
+            xshut = digitalio.DigitalInOut(board.D4)
+            xshut.direction = digitalio.Direction.OUTPUT
+            xshut.value = True # Membangunkan sensor
+            time.sleep(0.2)
+
+            # Inisialisasi I2C
             i2c = busio.I2C(board.SCL, board.SDA)
             
-            # CEK HARDWARE: Apakah ada device di alamat 0x29?
-            # Ini adalah bagian "cek apakah sensor ada atau tidak"
+            # BAGIAN PERBAIKAN: Cek apakah hardware terdeteksi di kabel
+            # Scan semua alamat I2C yang aktif
             while not i2c.try_lock():
                 pass
-            devices = i2c.scan()
+            found_devices = i2c.scan()
             i2c.unlock()
 
-            if 0x29 not in devices:
-                print("❌ HARDWARE NOT FOUND: Sensor is not detected on I2C bus (Check wiring/XSHUT)")
+            if 0x29 not in found_devices:
+                print("❌ HARDWARE TIDAK DITEMUKAN! Periksa kabel SDA/SCL/XSHUT.")
                 self.is_connected = False
                 return
 
-            # Jika hardware ditemukan, baru inisialisasi library
+            # Jika hardware ditemukan, baru jalankan driver-nya
             self.sensor = adafruit_vl53l0x.VL53L0X(i2c)
             self.is_connected = True
-            print("✅ VL53L0X hardware detected and initialized successfully")
+            print("✅ VL53L0X hardware detected and initialized!")
 
         except Exception as e:
-            print(f"❌ Initialization Error: {e}")
+            print(f"❌ Failed to initialize VL53L0X sensor: {e}")
             self.is_connected = False
 
     def read_distance(self) -> float:
@@ -83,3 +92,4 @@ if __name__ == "__main__":
             print("Stop")
     else:
         print("Sistem berhenti karena sensor tidak terdeteksi.")
+

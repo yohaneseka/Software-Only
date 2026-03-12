@@ -17,7 +17,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QPushButton,
     QRadioButton, QStackedWidget, QVBoxLayout, QCheckBox, QSpinBox,
-    QLineEdit  # <-- Ditambahkan untuk input nama pasien
+    QLineEdit
 )
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5 import uic
@@ -169,7 +169,7 @@ class MainWindow(QMainWindow):
         self.master_data_dir = os.path.join(self.base_dir, "DATA_PASIEN")
         os.makedirs(self.master_data_dir, exist_ok=True)
         
-        # Placeholder untuk folder spesifik per pasien (akan di-generate saat takeImage)
+        # Placeholder untuk folder spesifik per pasien
         self.current_raw_dir = None
         self.current_clust_dir = None
         self.current_sep_dir = None
@@ -198,7 +198,7 @@ class MainWindow(QMainWindow):
 
         # 3. MENGHUBUNGKAN ELEMEN UI
         self.stackedWidget = self.findChild(QStackedWidget, "stackedWidget")
-        self.nameInput = self.findChild(QLineEdit, "nameInput") # <-- TextBox Nama Pasien
+        self.nameInput = self.findChild(QLineEdit, "nameInput")
 
         self.mainPage = self.findChild(QPushButton, "mainBtn")
         self.segmentPage = self.findChild(QPushButton, "rbcBtn")
@@ -272,14 +272,22 @@ class MainWindow(QMainWindow):
             try: self.picam2.start()
             except Exception: pass
 
-        # Menyalakan Sensor Jarak
+        # 5. INISIALISASI SENSOR & TIMER
         self.sensor = MagnificationSensor()
         self.update_position()  
         
-    # --- FUNGSI PEMBUATAN FOLDER SESI (BARU) ---
+        self.sensor_timer = QTimer()
+        self.sensor_timer.timeout.connect(self.update_sensor_value)
+
+    # --- FUNGSI UPDATE SENSOR (REAL-TIME) ---
+    def update_sensor_value(self):
+        """Berjalan setiap 500ms untuk update GUI"""
+        distance = self.sensor.read_distance()
+        if self.distVal:
+            self.distVal.setText(f"Lens to Object Dist : {distance:.1f} mm")
+        
+    # --- FUNGSI PEMBUATAN FOLDER SESI ---
     def _create_session_folders(self):
-        """Membuat folder khusus untuk setiap kali pengambilan gambar berdasarkan Nama Pasien dan Waktu"""
-        # Cek apakah nama diisi
         if self.nameInput and self.nameInput.text().strip() != "":
             self.current_patient = self.nameInput.text().strip().replace(" ", "_")
         else:
@@ -287,7 +295,6 @@ class MainWindow(QMainWindow):
             
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         session_folder_name = f"{self.current_patient}_{timestamp}"
-        
         session_path = os.path.join(self.master_data_dir, session_folder_name)
         
         self.current_raw_dir = os.path.join(session_path, "0_raw_image")
@@ -297,8 +304,6 @@ class MainWindow(QMainWindow):
         
         for folder in [self.current_raw_dir, self.current_clust_dir, self.current_sep_dir, self.current_res_dir]:
             os.makedirs(folder, exist_ok=True)
-            
-        print(f"📁 Folder Sesi Dibuat: DATA_PASIEN/{session_folder_name}")
 
     # --- KONTROL MOTOR ---
     def fast_up(self):
@@ -329,12 +334,12 @@ class MainWindow(QMainWindow):
         if self.label_position:
             self.label_position.setText(f"Position: {motor_position} step")
 
-    # --- KONTROL KAMERA ---
+    # --- KONTROL KAMERA & SENSOR INPUT ---
     def cameraInputToggled(self, checked):
         if checked:
-            self.distance = self.sensor.read_distance()
-            self.distVal.setText(f"Lens to Object Dist : {self.distance} mm")
-            time.sleep(0.2)
+            # Mulai looping update sensor
+            self.sensor_timer.start(500)
+            
             if self.using_picam and self.qpicamera2 is not None:
                 if not self.qpicamera2.parent():
                     self.layout.setContentsMargins(0, 0, 0, 0)
@@ -349,7 +354,10 @@ class MainWindow(QMainWindow):
 
     def externalFileToggled(self, checked):
         if checked:
+            # Matikan timer sensor
+            self.sensor_timer.stop()
             self.distVal.setText("Camera is not active")
+            
             if self.using_picam and self.qpicamera2 is not None and self.qpicamera2.parent():
                 self.layout.removeWidget(self.qpicamera2)
                 self.qpicamera2.setParent(None)
@@ -362,9 +370,7 @@ class MainWindow(QMainWindow):
             self.inputIm.clear()
 
     def takeImage(self):
-        # Setiap ambil gambar, buat folder sesi baru!
         self._create_session_folders()
-        
         self.imagePath = None
         self.fileValue = False
         save_name = f"raw_{self.current_patient}.jpg"
@@ -407,7 +413,6 @@ class MainWindow(QMainWindow):
                 self.displayImage(self.imagePath)
 
     def on_capture_done(self, picam2):
-        # Lokasi membaca harus persis sama
         self.imagePath = os.path.join(self.current_raw_dir, f"raw_{self.current_patient}.jpg")
         time.sleep(0.5) 
         
@@ -459,7 +464,6 @@ class MainWindow(QMainWindow):
             )
 
             for idx, segment_image in enumerate(self.segmented_images):
-                # Simpan hasil cluster ke folder pasien saat ini
                 clusterPath = os.path.join(self.current_clust_dir, f"cluster_{idx+1}.jpg")
                 cv.imwrite(clusterPath, cv.cvtColor(segment_image, cv.COLOR_RGB2BGR))
                 
@@ -498,7 +502,6 @@ class MainWindow(QMainWindow):
             cv.rectangle(cells_detected, (lx, ly - lh - padding), (lx + lw + 2 * padding, ly + padding), (0, 0, 0), -1)
             cv.putText(cells_detected, label_text, (lx + padding, ly - padding), font, font_scale, (255, 255, 255), thickness, cv.LINE_AA)
           
-        # Simpan gambar deteksi awal ke folder results
         detectPath = os.path.join(self.current_res_dir, "detect_cells_initial.jpg")
         cv.imwrite(detectPath, cells_detected)
 
@@ -547,7 +550,6 @@ class MainWindow(QMainWindow):
         for idx, bbox in enumerate(bounding_boxes, start=1):
             x, y, w, h = bbox
             cv.rectangle(copy_rbc, (x, y), (x + w, y + h), (0, 255, 0), 5)
-            # Label
             center_x, center_y = x + w // 2, y + h // 2
             label_text = str(idx)
             font = cv.FONT_HERSHEY_SIMPLEX
@@ -571,7 +573,6 @@ class MainWindow(QMainWindow):
         self.cell_info = []
         for idx, (cells_image, x, y) in enumerate(self.extracted_cells):
             h, w = cells_image.shape[:2]
-            # Simpan potongan sel ke folder pasien saat ini
             filename = os.path.join(self.current_sep_dir, f"cell_{idx}.png")
             cv.imwrite(filename, cells_image)
             self.cell_info.append({"filename": f"cell_{idx}.png", "bbox": [x, y, w, h]})
@@ -580,7 +581,6 @@ class MainWindow(QMainWindow):
         self.rbcValText.setText("Saving cells and extracting features, please wait...")
         QApplication.processEvents()
 
-        # Excel fitur masuk ke folder 3_results pasien
         excel_path = os.path.join(self.current_res_dir, f"features_{self.current_patient}.xlsx")
         try:
             df_features, cell_labels, filter_stats = run_feature_extraction(
@@ -625,11 +625,9 @@ class MainWindow(QMainWindow):
             mi_scores = mutual_info_classif(X_feat, y_feat, random_state=42)
 
             mi_results = pd.DataFrame({"Feature": feature_cols, "MI_Score": mi_scores}).sort_values("MI_Score", ascending=False).reset_index(drop=True)
-
             mi_threshold      = 0.01
             selected_features = mi_results[mi_results["MI_Score"] > mi_threshold]["Feature"].tolist()
 
-            # Simpan hasil ML ke folder 3_results pasien
             excel_sel_path = os.path.join(self.current_res_dir, f"features_selected_{self.current_patient}.xlsx")
             excel_mi_path  = os.path.join(self.current_res_dir, f"mutual_info_{self.current_patient}.xlsx")
             df_selected    = df[["Cell_Label", "X", "Y"] + selected_features + ["IDA_Label"]]
@@ -727,6 +725,7 @@ class MainWindow(QMainWindow):
             except Exception: pass
         else:
             if hasattr(self, "timer") and self.timer.isActive(): self.timer.stop()
+            if hasattr(self, "sensor_timer") and self.sensor_timer.isActive(): self.sensor_timer.stop()
             if hasattr(self, "cap") and self.cap.isOpened():
                 try: self.cap.release()
                 except Exception: pass

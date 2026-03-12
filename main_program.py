@@ -1,26 +1,31 @@
 import sys
 import os
+import time
+import datetime
+import threading
+import glob
+import shutil
+import numpy as np
+import cv2 as cv
+import pandas as pd
+import imageio
+from PIL import Image
+from sklearn.feature_selection import mutual_info_classif
+from fpdf import FPDF
+
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QFileDialog, QPushButton,
-    QRadioButton, QStackedWidget, QVBoxLayout, QCheckBox, QSpinBox
+    QRadioButton, QStackedWidget, QVBoxLayout, QCheckBox, QSpinBox,
+    QLineEdit  # <-- Ditambahkan untuk input nama pasien
 )
 from PyQt5.QtGui import QPixmap, QImage
 from PyQt5 import uic
-import imageio
-from PIL import Image
-import numpy as np
-import cv2 as cv
-import shutil
+
+# Modul custom kamu
 from segmentyanes import *
 from sensor import *
 from feature_extraction import run_feature_extraction
-import glob
-import pandas as pd
-from sklearn.feature_selection import mutual_info_classif
-from fpdf import FPDF
-import time
-import threading  
 import resources_rc
 
 # Coba import picamera2
@@ -72,6 +77,7 @@ def move_motor(steps, direction):
     for p in pins:
         GPIO.output(p, 0)
 
+# --- CLASS REPORT PDF ---
 class PDFWithHeaderFooter(FPDF):
     def __init__(self, base_dir):
         super().__init__()
@@ -98,14 +104,18 @@ class PDFWithHeaderFooter(FPDF):
         self.set_y(-20)
         self.set_font("Poppins", "", 15)
         self.set_text_color(100)
-        self.cell(0, 10, "MalaScope, 2025", align="L")
+        self.cell(0, 10, "MalaScope, 2026", align="L")
         self.set_xy(65, 281)
         self.set_fill_color(4, 21, 98)
         self.cell(170, 2, fill=True)
 
-    def generate_result(self, imagePath, detectPath, cells, mal, parPath, output_path):
+    def generate_result(self, imagePath, detectPath, cells, mal, parPath, output_path, patient_name):
         self.add_page()
         self.set_font("Inter", size=12)
+        self.set_xy(18, 40)
+        self.set_text_color(0)
+        self.cell(170, 10, f"Patient Name / ID: {patient_name.replace('_', ' ')}", ln=True)
+        
         self.set_xy(18, 50)
         self.set_text_color(120)
         self.cell(170, 10, f"Report generated on {self.timestamp}", ln=True)
@@ -148,21 +158,25 @@ class PDFWithHeaderFooter(FPDF):
         self.output(output_path)
 
 
+# --- MAIN GUI CLASS ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         uic.loadUi("Main_Program.ui", self)
 
-        # --- SETUP WORKFLOW FOLDER ---
+        # 1. SETUP FOLDER MASTER DATA PASIEN
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.raw_dir = os.path.join(self.base_dir, "0_raw_image")
-        self.clust_dir = os.path.join(self.base_dir, "1_clustering_image")
-        self.sep_dir = os.path.join(self.base_dir, "2_separated_cells")
-        self.res_dir = os.path.join(self.base_dir, "3_results")
+        self.master_data_dir = os.path.join(self.base_dir, "DATA_PASIEN")
+        os.makedirs(self.master_data_dir, exist_ok=True)
+        
+        # Placeholder untuk folder spesifik per pasien (akan di-generate saat takeImage)
+        self.current_raw_dir = None
+        self.current_clust_dir = None
+        self.current_sep_dir = None
+        self.current_res_dir = None
+        self.current_patient = "Anonim"
 
-        for folder in [self.raw_dir, self.clust_dir, self.sep_dir, self.res_dir]:
-            os.makedirs(folder, exist_ok=True)
-
+        # 2. INISIALISASI KAMERA
         self.using_picam = PICAM_AVAILABLE
         self.picam2 = None
         self.qpicamera2 = None
@@ -182,8 +196,10 @@ class MainWindow(QMainWindow):
             self.timer = QTimer()
             self.timer.timeout.connect(self._update_frame)
 
-        # Inisialisasi UI
+        # 3. MENGHUBUNGKAN ELEMEN UI
         self.stackedWidget = self.findChild(QStackedWidget, "stackedWidget")
+        self.nameInput = self.findChild(QLineEdit, "nameInput") # <-- TextBox Nama Pasien
+
         self.mainPage = self.findChild(QPushButton, "mainBtn")
         self.segmentPage = self.findChild(QPushButton, "rbcBtn")
         self.detectPage = self.findChild(QPushButton, "malBtn")
@@ -228,6 +244,7 @@ class MainWindow(QMainWindow):
             self.spinBox_fine.setRange(1, 99999)
             self.spinBox_fine.setValue(100)
 
+        # 4. KONEKSI TOMBOL
         if self.btn_fast_up: self.btn_fast_up.clicked.connect(self.fast_up)
         if self.btn_fast_down: self.btn_fast_down.clicked.connect(self.fast_down)
         if self.btn_fine_up: self.btn_fine_up.clicked.connect(self.fine_up)
@@ -252,14 +269,37 @@ class MainWindow(QMainWindow):
         self.close_app.clicked.connect(self.closeApp)
 
         if self.using_picam and self.picam2 is not None:
-            try:
-                self.picam2.start()
-            except Exception:
-                pass
+            try: self.picam2.start()
+            except Exception: pass
 
+        # Menyalakan Sensor Jarak
         self.sensor = MagnificationSensor()
         self.update_position()  
         
+    # --- FUNGSI PEMBUATAN FOLDER SESI (BARU) ---
+    def _create_session_folders(self):
+        """Membuat folder khusus untuk setiap kali pengambilan gambar berdasarkan Nama Pasien dan Waktu"""
+        # Cek apakah nama diisi
+        if self.nameInput and self.nameInput.text().strip() != "":
+            self.current_patient = self.nameInput.text().strip().replace(" ", "_")
+        else:
+            self.current_patient = "Anonim"
+            
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        session_folder_name = f"{self.current_patient}_{timestamp}"
+        
+        session_path = os.path.join(self.master_data_dir, session_folder_name)
+        
+        self.current_raw_dir = os.path.join(session_path, "0_raw_image")
+        self.current_clust_dir = os.path.join(session_path, "1_clustering_image")
+        self.current_sep_dir = os.path.join(session_path, "2_separated_cells")
+        self.current_res_dir = os.path.join(session_path, "3_results")
+        
+        for folder in [self.current_raw_dir, self.current_clust_dir, self.current_sep_dir, self.current_res_dir]:
+            os.makedirs(folder, exist_ok=True)
+            
+        print(f"📁 Folder Sesi Dibuat: DATA_PASIEN/{session_folder_name}")
+
     # --- KONTROL MOTOR ---
     def fast_up(self):
         steps = self.spinBox_fast.value()
@@ -322,17 +362,18 @@ class MainWindow(QMainWindow):
             self.inputIm.clear()
 
     def takeImage(self):
+        # Setiap ambil gambar, buat folder sesi baru!
+        self._create_session_folders()
+        
         self.imagePath = None
         self.fileValue = False
-        
-        # Penamaan file gambar raw standar
-        save_name = "image_taken.jpg"
+        save_name = f"raw_{self.current_patient}.jpg"
         
         if self.imageSource[0].isChecked():
             if self.using_picam and self.picam2 is not None:
                 cfg = self.picam2.create_still_configuration(main={"size": (480, 270)})
-                # Simpan ke folder 0_raw_image
-                self.imagePath = os.path.join(self.raw_dir, save_name)
+                self.imagePath = os.path.join(self.current_raw_dir, save_name)
+                
                 self.picam2.switch_mode_and_capture_file(
                     cfg, self.imagePath, signal_function=self.on_capture_done
                 )
@@ -342,7 +383,7 @@ class MainWindow(QMainWindow):
                     self.cap = cv.VideoCapture(0)
                 ret, frame = self.cap.read()
                 if ret:
-                    self.imagePath = os.path.join(self.raw_dir, save_name)
+                    self.imagePath = os.path.join(self.current_raw_dir, save_name)
                     cv.imwrite(self.imagePath, frame)
                     self.displayImage(self.imagePath)
                     return
@@ -360,15 +401,15 @@ class MainWindow(QMainWindow):
 
             if file_dialog.exec_():
                 selected_files = file_dialog.selectedFiles()
-                self.imagePath = os.path.join(self.raw_dir, save_name)
+                self.imagePath = os.path.join(self.current_raw_dir, save_name)
                 self.fileValue = True
                 shutil.copy(selected_files[0], self.imagePath)
                 self.displayImage(self.imagePath)
 
     def on_capture_done(self, picam2):
-        # Alamat harus sama persis dengan yang di takeImage
-        self.imagePath = os.path.join(self.raw_dir, "image_taken.jpg")
-        time.sleep(0.5) # Beri jeda sistem tulis file
+        # Lokasi membaca harus persis sama
+        self.imagePath = os.path.join(self.current_raw_dir, f"raw_{self.current_patient}.jpg")
+        time.sleep(0.5) 
         
         if os.path.exists(self.imagePath):
             image = Image.open(self.imagePath)
@@ -399,12 +440,14 @@ class MainWindow(QMainWindow):
 
     # --- PENGOLAHAN CITRA ---
     def kmeansProcess(self):
+        if not self.current_clust_dir:
+            self.clusterText.setText("Silakan Get Image dulu!")
+            return
+            
         self.moveSegmentPage()
         self.segmentPage.setChecked(True)
         self.clusterText.setText("Please wait, doing k-means clustering...")
         QApplication.processEvents()
-
-        self.imagePath = os.path.join(self.raw_dir, "image_taken.jpg")
 
         if os.path.exists(self.imagePath):
             self.raw_image = imageio.imread(self.imagePath)
@@ -416,8 +459,8 @@ class MainWindow(QMainWindow):
             )
 
             for idx, segment_image in enumerate(self.segmented_images):
-                # Simpan hasil cluster ke folder 1_clustering_image
-                clusterPath = os.path.join(self.clust_dir, f"cluster_{idx+1}.jpg")
+                # Simpan hasil cluster ke folder pasien saat ini
+                clusterPath = os.path.join(self.current_clust_dir, f"cluster_{idx+1}.jpg")
                 cv.imwrite(clusterPath, cv.cvtColor(segment_image, cv.COLOR_RGB2BGR))
                 
                 self.pixmap = QPixmap(clusterPath)
@@ -455,8 +498,8 @@ class MainWindow(QMainWindow):
             cv.rectangle(cells_detected, (lx, ly - lh - padding), (lx + lw + 2 * padding, ly + padding), (0, 0, 0), -1)
             cv.putText(cells_detected, label_text, (lx + padding, ly - padding), font, font_scale, (255, 255, 255), thickness, cv.LINE_AA)
           
-        # Simpan preview hasil deteksi ke 3_results
-        detectPath = os.path.join(self.res_dir, "detect_cells.jpg")
+        # Simpan gambar deteksi awal ke folder results
+        detectPath = os.path.join(self.current_res_dir, "detect_cells_initial.jpg")
         cv.imwrite(detectPath, cells_detected)
 
         self.pixmap = QPixmap(detectPath)
@@ -516,7 +559,7 @@ class MainWindow(QMainWindow):
             cv.rectangle(copy_rbc, (lx, ly - lh - padding), (lx + lw + 2 * padding, ly + padding), (0, 0, 0), -1)
             cv.putText(copy_rbc, label_text, (lx + padding, ly - padding), font, font_scale, (255, 255, 255), thickness, cv.LINE_AA)
             
-        sepPath = os.path.join(self.res_dir, "after_sep.jpg")
+        sepPath = os.path.join(self.current_res_dir, "after_sep.jpg")
         cv.imwrite(sepPath, copy_rbc)
 
         self.pixmap = QPixmap(sepPath)
@@ -525,16 +568,11 @@ class MainWindow(QMainWindow):
         self.rbcValText.setText(f"Separation completed! {len(self.extracted_cells)} individual cells detected.")
 
     def saveExtractedCells(self):
-        # Hapus isi folder dataset ML lama agar tidak numpuk
-        for filename in os.listdir(self.sep_dir):
-            file_path = os.path.join(self.sep_dir, filename)
-            if os.path.isfile(file_path): os.remove(file_path)
-
         self.cell_info = []
         for idx, (cells_image, x, y) in enumerate(self.extracted_cells):
             h, w = cells_image.shape[:2]
-            # Simpan potongan sel ke folder 2_separated_cells (Sebagai Dataset ML)
-            filename = os.path.join(self.sep_dir, f"cell_{idx}.png")
+            # Simpan potongan sel ke folder pasien saat ini
+            filename = os.path.join(self.current_sep_dir, f"cell_{idx}.png")
             cv.imwrite(filename, cells_image)
             self.cell_info.append({"filename": f"cell_{idx}.png", "bbox": [x, y, w, h]})
 
@@ -542,8 +580,8 @@ class MainWindow(QMainWindow):
         self.rbcValText.setText("Saving cells and extracting features, please wait...")
         QApplication.processEvents()
 
-        # Excel masuk ke folder 3_results
-        excel_path = os.path.join(self.res_dir, "cell_features.xlsx")
+        # Excel fitur masuk ke folder 3_results pasien
+        excel_path = os.path.join(self.current_res_dir, f"features_{self.current_patient}.xlsx")
         try:
             df_features, cell_labels, filter_stats = run_feature_extraction(
                 extracted_cells=self.extracted_cells,
@@ -591,9 +629,9 @@ class MainWindow(QMainWindow):
             mi_threshold      = 0.01
             selected_features = mi_results[mi_results["MI_Score"] > mi_threshold]["Feature"].tolist()
 
-            # Simpan hasil ML ke folder 3_results
-            excel_sel_path = os.path.join(self.res_dir, "cell_features_selected.xlsx")
-            excel_mi_path  = os.path.join(self.res_dir, "mutual_information_scores.xlsx")
+            # Simpan hasil ML ke folder 3_results pasien
+            excel_sel_path = os.path.join(self.current_res_dir, f"features_selected_{self.current_patient}.xlsx")
+            excel_mi_path  = os.path.join(self.current_res_dir, f"mutual_info_{self.current_patient}.xlsx")
             df_selected    = df[["Cell_Label", "X", "Y"] + selected_features + ["IDA_Label"]]
             
             df_selected.to_excel(excel_sel_path, index=False)
@@ -618,7 +656,7 @@ class MainWindow(QMainWindow):
                 else: color = (0, 255, 0)
                 cv.rectangle(copy_rbc, (x, y), (x + w, y + h), color, 5)
 
-            self.detectResultPath = os.path.join(self.res_dir, "detect_result.png")
+            self.detectResultPath = os.path.join(self.current_res_dir, f"detect_result_{self.current_patient}.png")
             cv.imwrite(self.detectResultPath, copy_rbc)
 
             self.pixmap = QPixmap(self.detectResultPath)
@@ -644,19 +682,19 @@ class MainWindow(QMainWindow):
         quality_cell_count = len(self.df_features) if hasattr(self, "df_features") else 0
         cell_count = len(self.cell_info) if hasattr(self, "cell_info") else 0
         
-        pdf_path = os.path.join(self.res_dir, "Report_MalaScope.pdf")
-        csv_path = os.path.join(self.res_dir, "cell_features.csv") 
-
+        pdf_path = os.path.join(self.current_res_dir, f"Report_{self.current_patient}.pdf")
+        
         pdf = PDFWithHeaderFooter(self.base_dir)
         pdf.generate_result(
             imagePath=self.imagePath,
             detectPath=self.detectResultPath,
             cells=cell_count,
             mal=quality_cell_count,
-            parPath=csv_path,
-            output_path=pdf_path 
+            parPath=self.current_sep_dir,
+            output_path=pdf_path,
+            patient_name=self.current_patient
         )
-        self.detectText.setText(f"Report generated in PDF format at {self.res_dir}")
+        self.detectText.setText(f"Report generated in PDF format at {self.current_res_dir}")
 
     # --- FUNGSI UI LAINNYA ---
     def setStyles(self):

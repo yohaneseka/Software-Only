@@ -2,7 +2,6 @@ import sys
 import os
 import time
 import datetime
-import threading
 import glob
 import shutil
 import numpy as np
@@ -28,6 +27,26 @@ from sensor import *
 from feature_extraction import run_feature_extraction
 import resources_rc
 
+# --- INISIALISASI KOMUNIKASI SERIAL USB (RASPI ke ESP32) ---
+import serial
+SERIAL_AVAILABLE = False
+esp_serial = None
+
+# Sistem mencoba mencari ESP32 di port USB standar Linux
+try:
+    esp_serial = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+    SERIAL_AVAILABLE = True
+    print("✅ ESP32 Terhubung via /dev/ttyUSB0!")
+    time.sleep(2) # Waktu untuk ESP32 reset sejenak
+except Exception:
+    try:
+        esp_serial = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
+        SERIAL_AVAILABLE = True
+        print("✅ ESP32 Terhubung via /dev/ttyACM0!")
+        time.sleep(2)
+    except Exception as e:
+        print(f"❌ ESP32 Tidak Terdeteksi. Program jalan dalam Mode Simulasi Motor.")
+
 # Coba import picamera2
 try:
     from picamera2.previews.qt import QPicamera2
@@ -38,44 +57,7 @@ except Exception:
     Picamera2 = None
     PICAM_AVAILABLE = False
 
-# Coba import GPIO untuk motor
-try:
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    IN1, IN2, IN3, IN4 = 17, 18, 27, 22
-    pins = [IN1, IN2, IN3, IN4]
-    for p in pins:
-        GPIO.setup(p, GPIO.OUT)
-        GPIO.output(p, 0)
-    GPIO_AVAILABLE = True
-except Exception:
-    GPIO_AVAILABLE = False
-
-SEQ = [
-    [1,0,0,0], [1,1,0,0], [0,1,0,0], [0,1,1,0],
-    [0,0,1,0], [0,0,1,1], [0,0,0,1], [1,0,0,1]
-]
-
-step_delay = 0.002
 motor_position = 0 
-
-def move_motor(steps, direction):
-    global motor_position
-    if not GPIO_AVAILABLE:
-        print(f"[SIM] Motor {'naik' if direction==1 else 'turun'} {steps} steps")
-        motor_position += direction * steps
-        return
-
-    seq = SEQ if direction == 1 else list(reversed(SEQ))
-    for _ in range(abs(steps)):
-        for s in seq:
-            for pin, val in zip(pins, s):
-                GPIO.output(pin, val)
-            time.sleep(step_delay)
-        motor_position += direction
-
-    for p in pins:
-        GPIO.output(p, 0)
 
 # --- CLASS REPORT PDF ---
 class PDFWithHeaderFooter(FPDF):
@@ -169,7 +151,6 @@ class MainWindow(QMainWindow):
         self.master_data_dir = os.path.join(self.base_dir, "DATA_PASIEN")
         os.makedirs(self.master_data_dir, exist_ok=True)
         
-        # Placeholder untuk folder spesifik per pasien
         self.current_raw_dir = None
         self.current_clust_dir = None
         self.current_sep_dir = None
@@ -281,12 +262,10 @@ class MainWindow(QMainWindow):
 
     # --- FUNGSI UPDATE SENSOR (REAL-TIME) ---
     def update_sensor_value(self):
-        """Berjalan setiap 500ms untuk update GUI"""
         distance = self.sensor.read_distance()
         if self.distVal:
             self.distVal.setText(f"Lens to Object Dist : {distance:.1f} mm")
         
-    # --- FUNGSI PEMBUATAN FOLDER SESI ---
     def _create_session_folders(self):
         if self.nameInput and self.nameInput.text().strip() != "":
             self.current_patient = self.nameInput.text().strip().replace(" ", "_")
@@ -305,41 +284,47 @@ class MainWindow(QMainWindow):
         for folder in [self.current_raw_dir, self.current_clust_dir, self.current_sep_dir, self.current_res_dir]:
             os.makedirs(folder, exist_ok=True)
 
-    # --- KONTROL MOTOR ---
+    # --- KONTROL MOTOR MENGGUNAKAN SERIAL (KE ESP32) ---
+    def send_command_to_esp(self, direction_char, steps):
+        global motor_position
+        if SERIAL_AVAILABLE:
+            # Format pesan misal: "U100\n" atau "D50\n"
+            pesan = f"{direction_char}{steps}\n"
+            esp_serial.write(pesan.encode('utf-8'))
+        
+        # Update simulasi nilai posisi di GUI
+        dir_val = 1 if direction_char == 'U' else -1
+        motor_position += (dir_val * steps)
+        self.update_position()
+
     def fast_up(self):
         steps = self.spinBox_fast.value()
-        threading.Thread(target=move_motor, args=(steps, 1), daemon=True).start()
-        self.label_position.setText(f"Bergerak Naik {steps} steps...")
-        QTimer.singleShot(int(steps * step_delay * 8 * 1000) + 500, self.update_position)
+        self.label_position.setText(f"Memerintahkan ESP32 Naik {steps} steps...")
+        self.send_command_to_esp('U', steps)
 
     def fast_down(self):
         steps = self.spinBox_fast.value()
-        threading.Thread(target=move_motor, args=(steps, -1), daemon=True).start()
-        self.label_position.setText(f"Bergerak Turun {steps} steps...")
-        QTimer.singleShot(int(steps * step_delay * 8 * 1000) + 500, self.update_position)
+        self.label_position.setText(f"Memerintahkan ESP32 Turun {steps} steps...")
+        self.send_command_to_esp('D', steps)
 
     def fine_up(self):
         steps = self.spinBox_fine.value()
-        threading.Thread(target=move_motor, args=(steps, 1), daemon=True).start()
-        self.label_position.setText(f"Bergerak Naik {steps} steps...")
-        QTimer.singleShot(int(steps * step_delay * 8 * 1000) + 500, self.update_position)
+        self.label_position.setText(f"Memerintahkan ESP32 Naik (Fine) {steps} steps...")
+        self.send_command_to_esp('U', steps)
 
     def fine_down(self):
         steps = self.spinBox_fine.value()
-        threading.Thread(target=move_motor, args=(steps, -1), daemon=True).start()
-        self.label_position.setText(f"Bergerak Turun {steps} steps...")
-        QTimer.singleShot(int(steps * step_delay * 8 * 1000) + 500, self.update_position)
+        self.label_position.setText(f"Memerintahkan ESP32 Turun (Fine) {steps} steps...")
+        self.send_command_to_esp('D', steps)
 
     def update_position(self):
         if self.label_position:
             self.label_position.setText(f"Position: {motor_position} step")
 
-    # --- KONTROL KAMERA & SENSOR INPUT ---
+    # --- KONTROL KAMERA ---
     def cameraInputToggled(self, checked):
         if checked:
-            # Mulai looping update sensor
             self.sensor_timer.start(500)
-            
             if self.using_picam and self.qpicamera2 is not None:
                 if not self.qpicamera2.parent():
                     self.layout.setContentsMargins(0, 0, 0, 0)
@@ -354,10 +339,8 @@ class MainWindow(QMainWindow):
 
     def externalFileToggled(self, checked):
         if checked:
-            # Matikan timer sensor
             self.sensor_timer.stop()
             self.distVal.setText("Camera is not active")
-            
             if self.using_picam and self.qpicamera2 is not None and self.qpicamera2.parent():
                 self.layout.removeWidget(self.qpicamera2)
                 self.qpicamera2.setParent(None)
@@ -415,7 +398,6 @@ class MainWindow(QMainWindow):
     def on_capture_done(self, picam2):
         self.imagePath = os.path.join(self.current_raw_dir, f"raw_{self.current_patient}.jpg")
         time.sleep(0.5) 
-        
         if os.path.exists(self.imagePath):
             image = Image.open(self.imagePath)
             image.save(self.imagePath)
@@ -729,10 +711,11 @@ class MainWindow(QMainWindow):
             if hasattr(self, "cap") and self.cap.isOpened():
                 try: self.cap.release()
                 except Exception: pass
+        if esp_serial is not None and esp_serial.is_open:
+            esp_serial.close()
         super().closeEvent(event)
 
     def closeApp(self):
-        if GPIO_AVAILABLE: GPIO.cleanup()
         self.close()
 
 if __name__ == '__main__':

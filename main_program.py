@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import datetime
+import threading
 import glob
 import shutil
 import numpy as np
@@ -56,8 +57,6 @@ except Exception:
     QPicamera2 = None
     Picamera2 = None
     PICAM_AVAILABLE = False
-
-motor_position = 0 
 
 # --- CLASS REPORT PDF ---
 class PDFWithHeaderFooter(FPDF):
@@ -177,7 +176,7 @@ class MainWindow(QMainWindow):
             self.timer = QTimer()
             self.timer.timeout.connect(self._update_frame)
 
-        # 3. MENGHUBUNGKAN ELEMEN UI
+        # 3. MENGHUBUNGKAN ELEMEN UI (MENU & KAMERA)
         self.stackedWidget = self.findChild(QStackedWidget, "stackedWidget")
         self.nameInput = self.findChild(QLineEdit, "nameInput")
 
@@ -192,6 +191,11 @@ class MainWindow(QMainWindow):
         self.getButton = self.findChild(QPushButton, "getBtn")
         self.inputIm = self.findChild(QLabel, "rawImage")
         self.kmeansButton = self.findChild(QPushButton, "kmeansBtn")
+        
+        # Cari tombol "Do Segmentation" jika ID-nya berbeda
+        if not self.kmeansButton:
+            self.kmeansButton = self.findChild(QPushButton, "doSegBtn")
+
         self.layout = QVBoxLayout()
 
         self.clusterText = self.findChild(QLabel, "clustText")
@@ -210,52 +214,47 @@ class MainWindow(QMainWindow):
         self.visualIm = [self.findChild(QLabel, f"vizImage_{i}") for i in range(1, 9)]
         self.pdfGenButton = self.findChild(QPushButton, "pdfBtn")
 
-        self.spinBox_fast = self.findChild(QSpinBox, "spinBox_fast")
-        self.spinBox_fine = self.findChild(QSpinBox, "spinBox_fine")
-        self.label_position = self.findChild(QLabel, "label_position")
-        self.btn_fast_up   = self.findChild(QPushButton, "btn_fast_up")
-        self.btn_fast_down = self.findChild(QPushButton, "btn_fast_down")
-        self.btn_fine_up   = self.findChild(QPushButton, "btn_fine_up")
-        self.btn_fine_down = self.findChild(QPushButton, "btn_fine_down")
+        # --- 4. MENGHUBUNGKAN ELEMEN UI (MOTOR) ---
+        self.spinBox = self.findChild(QSpinBox, "spinBox")
+        self.upBtn = self.findChild(QPushButton, "upBtn")
+        self.downBtn = self.findChild(QPushButton, "downBtn")
+        self.stopBtn = self.findChild(QPushButton, "stopBtn")
 
-        if self.spinBox_fast:
-            self.spinBox_fast.setRange(1, 99999)
-            self.spinBox_fast.setValue(2000)
-        if self.spinBox_fine:
-            self.spinBox_fine.setRange(1, 99999)
-            self.spinBox_fine.setValue(100)
+        # Set range spinbox jika ditemukan
+        if self.spinBox:
+            self.spinBox.setRange(1, 99999)
+            self.spinBox.setValue(100) # Nilai default
 
-        # 4. KONEKSI TOMBOL
-        if self.btn_fast_up: self.btn_fast_up.clicked.connect(self.fast_up)
-        if self.btn_fast_down: self.btn_fast_down.clicked.connect(self.fast_down)
-        if self.btn_fine_up: self.btn_fine_up.clicked.connect(self.fine_up)
-        if self.btn_fine_down: self.btn_fine_down.clicked.connect(self.fine_down)
+        # Koneksi Tombol Motor
+        if self.upBtn: self.upBtn.clicked.connect(self.move_up)
+        if self.downBtn: self.downBtn.clicked.connect(self.move_down)
+        if self.stopBtn: self.stopBtn.clicked.connect(self.stop_motor)
+
+        # Koneksi Tombol Utama
+        if self.imageSource[0]: self.imageSource[0].toggled.connect(self.cameraInputToggled)
+        if self.imageSource[1]: self.imageSource[1].toggled.connect(self.externalFileToggled)
+        if self.getButton: self.getButton.clicked.connect(self.takeImage)
+        if self.kmeansButton: self.kmeansButton.clicked.connect(self.kmeansProcess)
+        if self.extractButton: self.extractButton.clicked.connect(self.extractCells)
+        if self.sepOverlap: self.sepOverlap.clicked.connect(self.separateOverlap)
+        if self.saveCells: self.saveCells.clicked.connect(self.saveExtractedCells)
+        if self.detectButton: self.detectButton.clicked.connect(self.detectCells)
+        if self.pdfGenButton: self.pdfGenButton.clicked.connect(self.generatePDF)
+
+        if self.mainPage: self.mainPage.clicked.connect(self.moveMainPage)
+        if self.segmentPage: self.segmentPage.clicked.connect(self.moveSegmentPage)
+        if self.detectPage: self.detectPage.clicked.connect(self.moveDetectPage)
+        if self.aboutPage: self.aboutPage.clicked.connect(self.moveAboutPage)
+        if self.close_app: self.close_app.clicked.connect(self.closeApp)
 
         self.setStyles()
-
-        self.imageSource[0].toggled.connect(self.cameraInputToggled)
-        self.imageSource[1].toggled.connect(self.externalFileToggled)
-        self.getButton.clicked.connect(self.takeImage)
-        self.kmeansButton.clicked.connect(self.kmeansProcess)
-        self.extractButton.clicked.connect(self.extractCells)
-        self.sepOverlap.clicked.connect(self.separateOverlap)
-        self.saveCells.clicked.connect(self.saveExtractedCells)
-        self.detectButton.clicked.connect(self.detectCells)
-        self.pdfGenButton.clicked.connect(self.generatePDF)
-
-        self.mainPage.clicked.connect(self.moveMainPage)
-        self.segmentPage.clicked.connect(self.moveSegmentPage)
-        self.detectPage.clicked.connect(self.moveDetectPage)
-        self.aboutPage.clicked.connect(self.moveAboutPage)
-        self.close_app.clicked.connect(self.closeApp)
 
         if self.using_picam and self.picam2 is not None:
             try: self.picam2.start()
             except Exception: pass
 
-        # 5. INISIALISASI SENSOR & TIMER
+        # 5. INISIALISASI SENSOR JARAK & TIMER
         self.sensor = MagnificationSensor()
-        self.update_position()  
         
         self.sensor_timer = QTimer()
         self.sensor_timer.timeout.connect(self.update_sensor_value)
@@ -264,8 +263,12 @@ class MainWindow(QMainWindow):
     def update_sensor_value(self):
         distance = self.sensor.read_distance()
         if self.distVal:
-            self.distVal.setText(f"Lens to Object Dist : {distance:.1f} mm")
+            if not np.isnan(distance):
+                self.distVal.setText(f"Lens to Object Dist : {distance:.1f} mm")
+            else:
+                self.distVal.setText("Lens to Object Dist : Error/Out of Range")
         
+    # --- FUNGSI PEMBUATAN FOLDER SESI ---
     def _create_session_folders(self):
         if self.nameInput and self.nameInput.text().strip() != "":
             self.current_patient = self.nameInput.text().strip().replace(" ", "_")
@@ -286,45 +289,44 @@ class MainWindow(QMainWindow):
 
     # --- KONTROL MOTOR MENGGUNAKAN SERIAL (KE ESP32) ---
     def send_command_to_esp(self, direction_char, steps):
-        global motor_position
-        if SERIAL_AVAILABLE:
-            # Format pesan misal: "U100\n" atau "D50\n"
+        if SERIAL_AVAILABLE and esp_serial is not None and esp_serial.is_open:
             pesan = f"{direction_char}{steps}\n"
+            try:
+                esp_serial.write(pesan.encode('utf-8'))
+                print(f"📡 Mengirim ke ESP32: {pesan.strip()}")
+            except Exception as e:
+                print(f"❌ Gagal mengirim perintah serial: {e}")
+        else:
+            print(f"⚠️ Mode Simulasi (USB Tidak Terhubung): Motor {direction_char} {steps} langkah")
+
+    def move_up(self):
+        if self.spinBox:
+            steps = self.spinBox.value()
+            if steps > 0:
+                self.send_command_to_esp('U', steps)
+        else:
+            print("❌ Kotak spinBox tidak ditemukan di UI!")
+
+    def move_down(self):
+        if self.spinBox:
+            steps = self.spinBox.value()
+            if steps > 0:
+                self.send_command_to_esp('D', steps)
+        else:
+            print("❌ Kotak spinBox tidak ditemukan di UI!")
+
+    def stop_motor(self):
+        # Mengirim perintah langkah 0 sebagai tanda berhenti (jika ESP32 diprogram utk berhenti mendadak)
+        # Atau bisa juga untuk sekadar mematikan arus (relaksasi motor)
+        print("🛑 Tombol Stop Ditekan")
+        if SERIAL_AVAILABLE and esp_serial is not None and esp_serial.is_open:
+            pesan = "S0\n" # Sinyal stop opsional
             esp_serial.write(pesan.encode('utf-8'))
-        
-        # Update simulasi nilai posisi di GUI
-        dir_val = 1 if direction_char == 'U' else -1
-        motor_position += (dir_val * steps)
-        self.update_position()
-
-    def fast_up(self):
-        steps = self.spinBox_fast.value()
-        self.label_position.setText(f"Memerintahkan ESP32 Naik {steps} steps...")
-        self.send_command_to_esp('U', steps)
-
-    def fast_down(self):
-        steps = self.spinBox_fast.value()
-        self.label_position.setText(f"Memerintahkan ESP32 Turun {steps} steps...")
-        self.send_command_to_esp('D', steps)
-
-    def fine_up(self):
-        steps = self.spinBox_fine.value()
-        self.label_position.setText(f"Memerintahkan ESP32 Naik (Fine) {steps} steps...")
-        self.send_command_to_esp('U', steps)
-
-    def fine_down(self):
-        steps = self.spinBox_fine.value()
-        self.label_position.setText(f"Memerintahkan ESP32 Turun (Fine) {steps} steps...")
-        self.send_command_to_esp('D', steps)
-
-    def update_position(self):
-        if self.label_position:
-            self.label_position.setText(f"Position: {motor_position} step")
 
     # --- KONTROL KAMERA ---
     def cameraInputToggled(self, checked):
         if checked:
-            self.sensor_timer.start(500)
+            self.sensor_timer.start(500) # Nyalakan bacaan sensor Real-Time
             if self.using_picam and self.qpicamera2 is not None:
                 if not self.qpicamera2.parent():
                     self.layout.setContentsMargins(0, 0, 0, 0)
@@ -339,8 +341,10 @@ class MainWindow(QMainWindow):
 
     def externalFileToggled(self, checked):
         if checked:
-            self.sensor_timer.stop()
-            self.distVal.setText("Camera is not active")
+            self.sensor_timer.stop() # Matikan bacaan sensor
+            if self.distVal:
+                self.distVal.setText("Camera is not active")
+            
             if self.using_picam and self.qpicamera2 is not None and self.qpicamera2.parent():
                 self.layout.removeWidget(self.qpicamera2)
                 self.qpicamera2.setParent(None)
@@ -680,26 +684,22 @@ class MainWindow(QMainWindow):
     def setStyles(self):
         button_style = "QPushButton {border:1px; border-radius: 10px; color: rgb(0,0,0); background-color: rgb(214, 222, 255);} QPushButton:hover {background-color: rgb(35, 56, 148); color: rgb(255,255,255);} QPushButton:checked {background-color: rgb(4, 21, 98); color: rgb(255,255,255);}"
         menu_style = "QPushButton {border:1px; color: rgb(225,225,225); background-color: rgb(17, 70, 143)} QPushButton:hover {background-color: rgb(35, 56, 148); color: rgb(255,255,255);} QPushButton:checked {background-color: rgb(4, 21, 98); color: rgb(255,255,255);}"
-        motor_style = "QPushButton {border:1px; border-radius: 8px; color: rgb(255,255,255); background-color: rgb(34, 139, 34);} QPushButton:hover {background-color: rgb(0, 100, 0);} QPushButton:pressed {background-color: rgb(0, 60, 0);}"
         
-        self.mainPage.setStyleSheet(menu_style)
-        self.segmentPage.setStyleSheet(button_style)
-        self.detectPage.setStyleSheet(button_style)
-        self.aboutPage.setStyleSheet(menu_style)
-        for btn_name in ["btn_fast_up", "btn_fast_down", "btn_fine_up", "btn_fine_down"]:
-            btn = self.findChild(QPushButton, btn_name)
-            if btn: btn.setStyleSheet(motor_style)
+        if self.mainPage: self.mainPage.setStyleSheet(menu_style)
+        if self.segmentPage: self.segmentPage.setStyleSheet(button_style)
+        if self.detectPage: self.detectPage.setStyleSheet(button_style)
+        if self.aboutPage: self.aboutPage.setStyleSheet(menu_style)
 
     def moveMainPage(self):
-        self.stackedWidget.setCurrentIndex(0)
+        if self.stackedWidget: self.stackedWidget.setCurrentIndex(0)
     def moveSegmentPage(self):
-        self.stackedWidget.setCurrentIndex(1)
+        if self.stackedWidget: self.stackedWidget.setCurrentIndex(1)
     def moveExtractPage(self):
-        self.stackedWidget.setCurrentIndex(2)
+        if self.stackedWidget: self.stackedWidget.setCurrentIndex(2)
     def moveDetectPage(self):
-        self.stackedWidget.setCurrentIndex(3)
+        if self.stackedWidget: self.stackedWidget.setCurrentIndex(3)
     def moveAboutPage(self):
-        self.stackedWidget.setCurrentIndex(4)
+        if self.stackedWidget: self.stackedWidget.setCurrentIndex(4)
 
     def closeEvent(self, event):
         if self.using_picam and self.picam2 is not None:
